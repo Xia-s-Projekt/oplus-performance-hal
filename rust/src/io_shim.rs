@@ -1,13 +1,14 @@
-// Absolute-path I/O with a test-root override.
+// Absolute-path I/O with a test-only root override.
 //
-// The whole HAL is `/proc` and `/sys` reads, so on the host there is nothing it
-// could legitimately touch. Every absolute path goes through `resolve`, which
-// prepends a process-global root when one is set. Tests set it to a temp
-// directory holding a fake `/proc` tree and the real code paths run unmodified.
+// Production `resolve` uses paths verbatim: the HAL only reads `/proc` and
+// `/sys`, in parallel across the binder thread pool, so the I/O path must not
+// take a global lock. Tests compile a second `resolve` that prepends a fixture
+// root so the real code paths run unmodified against a fake `/proc` tree.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Mutex;
 
 /// A reply parcel is capped at ~1 MiB by libbinder. Several of the nodes this
@@ -17,6 +18,7 @@ use std::sync::Mutex;
 /// read so the call still succeeds and returns a truncated but usable dump.
 pub const MAX_READ: usize = 256 * 1024;
 
+#[cfg(test)]
 static TEST_ROOT: Mutex<Option<String>> = Mutex::new(None);
 
 #[cfg(test)]
@@ -26,6 +28,7 @@ static TESTS: Mutex<()> = Mutex::new(());
 /// so without recovery one failure would cascade into every later test. The
 /// lock only serialises tests and protects no invariant, so recovering the
 /// guard is correct.
+#[cfg(test)]
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -45,9 +48,18 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     lock(&TESTS)
 }
 
-/// Prepends the test root when set. Idempotent: a path already under the root
-/// is returned unchanged, because callers legitimately hand a resolved path
-/// (from a directory listing or a symlink target) back to the read helpers.
+/// Production: absolute paths are used verbatim. No lock, no allocation
+/// beyond the `PathBuf` the caller needs for the syscall.
+#[cfg(not(test))]
+pub fn resolve(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Test only: prepends the fixture root when set. Idempotent: a path already
+/// under the root is returned unchanged, because callers legitimately hand a
+/// resolved path (from a directory listing or a symlink target) back to the
+/// read helpers.
+#[cfg(test)]
 pub fn resolve(path: &Path) -> PathBuf {
     if path.is_absolute() {
         let root = lock(&TEST_ROOT).clone();
@@ -74,7 +86,10 @@ pub fn read(path: &str) -> String {
             use std::io::Read;
             let mut buf = Vec::with_capacity(4096);
             let _ = file.take(MAX_READ as u64).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
+            match String::from_utf8(buf) {
+                Ok(text) => text,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            }
         }
         Err(_) => String::new(),
     }
